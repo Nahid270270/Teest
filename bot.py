@@ -9,7 +9,7 @@ import re
 import traceback
 import logging
 
-# লগিং সেটআপ করুন (ঐচ্ছিক, তবে ডিবাগিংয়ের জন্য খুব সহায়ক)
+# লগিং সেটআপ করুন
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -22,23 +22,18 @@ load_dotenv()
 # --- Flask অ্যাপ সেটআপ ---
 app = Flask(__name__)
 
-# --- Pyrogram ক্লায়েন্ট সেটিংস লোড করুন ---
+# --- Pyrogram ক্লায়েন্ট সেটিংস ---
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 
-# ডাউনলোড ডিরেক্টরি তৈরি করুন যদি না থাকে
+# ডাউনলোড ডিরেক্টরি তৈরি করুন
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Pyrogram ক্লায়েন্ট অবজেক্টকে গ্লোবালি ঘোষণা করুন
-# এটি run_bot_in_thread ফাংশনের মধ্যে ইনিশিয়ালাইজ হবে।
-bot_client_instance = None
-
-# একটি ডামি Pyrogram ক্লায়েন্ট অবজেক্ট তৈরি করুন
-# এটি শুধুমাত্র @bot.on_message ডেকোরেটরগুলোর জন্য একটি টার্গেট হিসেবে কাজ করবে।
-# আসল ক্লায়েন্ট পরে run_bot_in_thread এর ভিতরে তৈরি হবে।
-bot = Client("dummy_client", no_updates=True)
+# Pyrogram ক্লায়েন্ট ইনস্ট্যান্স গ্লোবালি রাখা হবে, যা থ্রেডের ভেতরে ইনিশিয়ালাইজ হবে।
+# এটি None দিয়ে শুরু করা হয়েছে।
+pyrogram_client = None
 
 # --- ভিডিও ডাউনলোড ফাংশন ---
 async def download_m3u8_video(client: Client, message: Message, m3u8_url: str):
@@ -66,7 +61,6 @@ async def download_m3u8_video(client: Client, message: Message, m3u8_url: str):
                 logger.error(f"Error during m3u8 download with m3u8_To_MP4: {e}", exc_info=True)
                 return False
 
-        # একটি নতুন থ্রেডে সিঙ্ক্রোনাস ডাউনলোড ফাংশন চালান
         download_successful = await asyncio.to_thread(_sync_download_task)
 
         if download_successful and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
@@ -89,12 +83,17 @@ async def download_m3u8_video(client: Client, message: Message, m3u8_url: str):
             await status_message.edit_text(error_message)
 
 # --- Pyrogram মেসেজ হ্যান্ডলার ---
-@bot.on_message(filters.command("start") & filters.private)
+# এই হ্যান্ডলারগুলো একটি টেম্পোরারি ক্লায়েন্ট অবজেক্টের সাথে যুক্ত হবে
+# এবং পরে আসল ক্লায়েন্টে কপি করা হবে।
+# এটি Pyrogram এর ডেকোরেটর সিনট্যাক্স ব্যবহারের জন্য প্রয়োজনীয়।
+temp_bot_client = Client("temp_client", no_updates=True)
+
+@temp_bot_client.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     logger.info(f"Received /start command from {message.from_user.id}")
     await message.reply_text("👋 **হ্যালো!** আমি একটি m3u8 ভিডিও ডাউনলোডার বট।\n\nআমাকে একটি **m3u8 লিংক** পাঠান এবং আমি ভিডিওটি ডাউনলোড করে আপনাকে পাঠিয়ে দেব।")
 
-@bot.on_message(filters.text & filters.private)
+@temp_bot_client.on_message(filters.text & filters.private)
 async def handle_any_text_message(client, message: Message):
     m3u8_url = message.text.strip()
     logger.info(f"Received text message from {message.from_user.id}: {m3u8_url}")
@@ -105,50 +104,53 @@ async def handle_any_text_message(client, message: Message):
         await message.reply_text("🤔 দুঃখিত, এটি একটি বৈধ m3u8 লিংক বলে মনে হচ্ছে না।\n\nঅনুগ্রহ করে একটি **সঠিক m3u8 লিংক** পাঠান।")
 
 # --- বট চালানোর ফাংশন (আলাদা থ্রেডে) ---
-def run_bot_in_thread():
-    # প্রথমে নতুন ইভেন্ট লুপ তৈরি করুন
+def run_pyrogram_bot():
+    """
+    Pyrogram বটকে একটি আলাদা থ্রেডে অ্যাসিঙ্ক্রোনাস লুপে চালায়।
+    """
+    # এই থ্রেডের জন্য একটি নতুন asyncio ইভেন্ট লুপ তৈরি এবং সেট করুন।
     loop = asyncio.new_event_loop()
-    # এই থ্রেডের জন্য লুপটিকে 'বর্তমান' লুপ হিসেবে সেট করুন
     asyncio.set_event_loop(loop)
 
-    global bot_client_instance # গ্লোবাল ইনস্ট্যান্স অ্যাক্সেস করার জন্য
+    global pyrogram_client # গ্লোবাল pyrogram_client ইনস্ট্যান্স অ্যাক্সেস করার জন্য
 
     try:
-        # Pyrogram ক্লায়েন্টকে এই থ্রেডের ভেতরে তৈরি করুন
-        # নিশ্চিত করুন যে লুপ সেট করার পরেই ক্লায়েন্ট তৈরি হচ্ছে
-        bot_client_instance = Client(
+        # Pyrogram ক্লায়েন্ট ইনস্ট্যান্স তৈরি করুন
+        pyrogram_client = Client(
             "m3u8_downloader_bot",
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN
         )
 
-        # ডেকোরেটর দ্বারা যুক্ত হ্যান্ডলারগুলোকে আসল ক্লায়েন্ট ইনস্ট্যান্সে কপি করুন
-        for handler in bot.handlers:
-            bot_client_instance.add_handler(handler[0], handler[1].group)
-
+        # temp_bot_client থেকে হ্যান্ডলারগুলোকে আসল pyrogram_client এ কপি করুন
+        # Pyrogram 2.x এর ডিসপ্যাচার কাঠামো ব্যবহার করে।
+        for group_id in temp_bot_client.dispatcher.handlers:
+            for handler in temp_bot_client.dispatcher.handlers[group_id]:
+                pyrogram_client.add_handler(handler)
+        
         logger.info("Pyrogram বট শুরু হচ্ছে...")
-        loop.run_until_complete(bot_client_instance.start())
+        loop.run_until_complete(pyrogram_client.start())
         logger.info("Pyrogram বট সফলভাবে শুরু হয়েছে।")
         loop.run_forever() # ইভেন্ট লুপকে অনির্দিষ্টকালের জন্য চালু রাখবে
     except Exception as e:
         logger.error(f"বট চালানোর সময় ত্রুটি: {e}", exc_info=True)
     finally:
         logger.info("Pyrogram বট বন্ধ হচ্ছে...")
-        if bot_client_instance and bot_client_instance.is_connected:
-            loop.run_until_complete(bot_client_instance.stop())
+        if pyrogram_client and pyrogram_client.is_connected:
+            loop.run_until_complete(pyrogram_client.stop())
         loop.close()
         logger.info("Pyrogram বট বন্ধ হয়েছে।")
 
 # --- Flask রুটস ---
 @app.route('/')
 def home():
-    status = "চলছে" if bot_client_instance and bot_client_instance.is_connected else "শুরু হয়নি/বন্ধ আছে"
-    return f"আপনার Pyrogram বট এবং Flask অ্যাপ সচল আছে! বট বর্তমানে: {status}। একটি m3u8 লিংক পাঠান।"
+    bot_status = "চলছে" if pyrogram_client and pyrogram_client.is_connected else "শুরু হয়নি/বন্ধ আছে"
+    return f"আপনার Pyrogram বট এবং Flask অ্যাপ সচল আছে! বট বর্তমানে: {bot_status}। একটি m3u8 লিংক পাঠান।"
 
 @app.route('/health')
 def health_check():
-    if bot_client_instance and bot_client_instance.is_connected:
+    if pyrogram_client and pyrogram_client.is_connected:
         return "OK", 200
     else:
         return "Bot Not Connected", 503
@@ -156,10 +158,12 @@ def health_check():
 # --- অ্যাপ্লিকেশন এন্ট্রি পয়েন্ট ---
 if __name__ == '__main__':
     # Pyrogram বটকে একটি আলাদা থ্রেডে চালান
-    bot_thread = threading.Thread(target=run_bot_in_thread, daemon=True)
+    # daemon=True নিশ্চিত করে যে মূল Flask অ্যাপ বন্ধ হলে এটিও বন্ধ হয়।
+    bot_thread = threading.Thread(target=run_pyrogram_bot, daemon=True)
     bot_thread.start()
 
     # Flask অ্যাপ চালান
+    # "0.0.0.0" এ চালান যাতে এটি যেকোনো ইনকামিং কানেকশন গ্রহণ করে।
     port = int(os.getenv("PORT", 10000))
     logger.info(f"Flask অ্যাপ পোর্ট {port} এ চলছে...")
     app.run(host='0.0.0.0', port=port)
