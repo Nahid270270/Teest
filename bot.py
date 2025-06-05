@@ -1,41 +1,33 @@
 import os
 import threading
-import subprocess
-import logging # ✅ লগিং যোগ করা হয়েছে
-from flask import Flask
+import asyncio
+from flask import Flask, request, jsonify
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from dotenv import load_dotenv # ✅ .env ফাইল থেকে পরিবেশ ভেরিয়েবল লোড করার জন্য
+from dotenv import load_dotenv
+import re
+import traceback
+
+# m3u8-To-MP4 লাইব্রেরি ইম্পোর্ট করুন (যদি এটি আপনার পছন্দের হয়)
+# pip install m3u8-To-MP4
+import m3u8_To_MP4 # নিশ্চিত করুন এই লাইব্রেরিটি ইনস্টল করা আছে
 
 # .env ফাইল থেকে পরিবেশ ভেরিয়েবল লোড করুন
 load_dotenv()
 
-# -------------------- Configuration --------------------
-# ✅ পরিবেশ ভেরিয়েবল থেকে সংবেদনশীল তথ্য লোড করুন
+# --- Flask অ্যাপ সেটআপ ---
+app = Flask(__name__)
+
+# --- Pyrogram ক্লায়েন্ট সেটআপ ---
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads") # ডিফল্ট ডিরেক্টরি
 
-DOWNLOAD_DIR = "./downloads"
+# ডাউনলোড ডিরেক্টরি তৈরি করুন যদি না থাকে
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ✅ লগিং সেটআপ করুন
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    handlers=[
-                        logging.FileHandler("bot.log"),
-                        logging.StreamHandler()
-                    ])
-logger = logging.getLogger(__name__)
-
-
-# -------------------- Flask App --------------------
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return "✅ M3U8 Downloader Bot is Running!"
-
-# -------------------- Pyrogram Bot --------------------
+# Pyrogram ক্লায়েন্ট তৈরি করুন
 bot = Client(
     "m3u8_downloader_bot",
     api_id=API_ID,
@@ -43,69 +35,95 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-@bot.on_message(filters.private & filters.text)
-async def m3u8_handler(client: Client, message: Message):
-    url = message.text.strip()
-    user_id = message.from_user.id
-
-    if not url.endswith(".m3u8"):
-        await message.reply("⚠️ দয়া করে একটি বৈধ `.m3u8` লিংক পাঠান।")
-        logger.info(f"Invalid M3U8 link received from {user_id}: {url}")
-        return
-
-    initial_message = await message.reply("📥 ভিডিও ডাউনলোড শুরু হচ্ছে... একটু অপেক্ষা করুন।")
-    logger.info(f"Starting download for {user_id} from URL: {url}")
-
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    # ✅ ফাইল নাম স্যানিটাইজ করা হয়েছে (যদিও user_id এক্ষেত্রে নিরাপদ)
-    output_filename = f"{user_id}_{os.path.basename(urlparse(url).path).replace('.', '_')}.mp4"
-    output_file = os.path.join(DOWNLOAD_DIR, output_filename)
-
-    cmd = [
-        "ffmpeg",
-        "-i", url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-y",  # overwrite if exists
-        output_file
-    ]
-
+# --- ভিডিও ডাউনলোড ফাংশন ---
+async def download_m3u8_video(client: Client, message: Message, m3u8_url: str):
     try:
-        # ✅ subprocess.run এর পরিবর্তে asyncio.create_subprocess_exec ব্যবহার করা যেতে পারে
-        # তবে সরলতার জন্য subprocess.run রাখা হয়েছে।
-        # দীর্ঘ ডাউনলোডের জন্য নন-ব্লকিং সমাধানের প্রয়োজন হতে পারে।
-        process = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info(f"Successfully downloaded video for {user_id}. Output: {process.stdout}")
-        await initial_message.edit_text("✅ ভিডিও আপলোড করা হচ্ছে...") # ✅ আপলোডিং স্ট্যাটাস
-        await message.reply_video(video=output_file, caption="✅ ভিডিও রেডি!")
+        status_message = await message.reply_text("ভিডিও ডাউনলোড শুরু হচ্ছে... একটু অপেক্ষা করুন।")
 
-    except subprocess.CalledProcessError as e:
-        error_message = f"❌ ভিডিও ডাউনলোডে সমস্যা হয়েছে। লিংকটি সঠিক কিনা যাচাই করুন।\nবিস্তারিত: {e.stderr}"
-        await initial_message.edit_text(error_message)
-        logger.error(f"Download failed for {user_id} from {url}. Error: {e.stderr}")
+        # ফাইল নাম তৈরি করুন (লিংক থেকে অথবা র্যান্ডম)
+        file_name_match = re.search(r'[^/]+(?=\.m3u8)', m3u8_url)
+        if file_name_match:
+            base_name = file_name_match.group(0)
+        else:
+            base_name = "downloaded_video"
+
+        output_path = os.path.join(DOWNLOAD_DIR, f"{base_name}.mp4")
+
+        await status_message.edit_text(f"ভিডিও ডাউনলোড হচ্ছে: `{m3u8_url}`\nএটি কিছু সময় নিতে পারে...")
+
+        def _sync_download_task():
+            try:
+                # m3u8_To_MP4 ব্যবহার করে ভিডিও ডাউনলোড করুন
+                m3u8_To_MP4.download(m3u8_url, custom_file_name=output_path)
+                return True
+            except Exception as e:
+                print(f"Error during m3u8 download with m3u8_To_MP4: {e}")
+                return False
+
+        # একটি নতুন থ্রেডে সিঙ্ক্রোনাস ডাউনলোড ফাংশন চালান
+        download_successful = await asyncio.to_thread(_sync_download_task)
+
+        if download_successful and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            await status_message.edit_text("ভিডিও ডাউনলোড সম্পন্ন! এখন আপলোড করা হচ্ছে... 📤")
+            await message.reply_document(
+                document=output_path,
+                caption=f"ভিডিও ডাউনলোড সম্পন্ন! ✅"
+            )
+            # ডাউনলোড শেষে ফাইলটি ডিলিট করে দিন
+            os.remove(output_path)
+            print(f"ডাউনলোড করা ফাইল ডিলিট করা হয়েছে: {output_path}")
+        else:
+            await status_message.edit_text("ভিডিও ডাউনলোড ব্যর্থ হয়েছে। লিংকে সমস্যা থাকতে পারে অথবা সার্ভার অ্যাক্সেস করতে পারেনি।")
+
     except Exception as e:
-        error_message = "❌ একটি অপ্রত্যাশিত ত্রুটি ঘটেছে। দয়া করে আবার চেষ্টা করুন।"
-        await initial_message.edit_text(error_message)
-        logger.error(f"An unexpected error occurred for {user_id} from {url}. Error: {e}")
+        await status_message.edit_text(f"ভিডিও ডাউনলোড করার সময় একটি ত্রুটি হয়েছে: {e}\n\n```python\n{traceback.format_exc()}\n```")
+        print(f"ডাউনলোড ফাংশনে অপ্রত্যাশিত ত্রুটি: {e}")
+        traceback.print_exc()
+
+# --- Pyrogram মেসেজ হ্যান্ডলার ---
+@bot.on_message(filters.command("start") & filters.private)
+async def start_command(client, message):
+    await message.reply_text("হ্যালো! আমি একটি m3u8 ভিডিও ডাউনলোডার বট। আমাকে একটি m3u8 লিংক পাঠান এবং আমি ভিডিওটি ডাউনলোড করে আপনাকে পাঠিয়ে দেব।")
+
+@bot.on_message(filters.regex(r'https?://.*\.(m3u8|M3U8)') & filters.private) # .m3u8 বা .M3U8 উভয়ই ধরবে
+async def handle_m3u8_link(client, message: Message):
+    m3u8_url = message.text.strip()
+    await download_m3u8_video(client, message, m3u8_url)
+
+@bot.on_message(filters.text & filters.private)
+async def echo_message(client, message):
+    if not re.match(r'https?://.*\.(m3u8|M3U8)', message.text.strip()):
+        await message.reply_text("আমি একটি m3u8 ভিডিও ডাউনলোডার বট। অনুগ্রহ করে একটি বৈধ m3u8 লিংক পাঠান।")
+
+# --- বট চালানোর ফাংশন (আলাদা থ্রেডে) ---
+def run_bot_in_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        print("Pyrogram বট শুরু হচ্ছে...")
+        bot.run()
+    except Exception as e:
+        print(f"বট চালানোর সময় ত্রুটি: {e}")
     finally:
-        if os.path.exists(output_file):
-            os.remove(output_file)
-            logger.info(f"Cleaned up file: {output_file}")
+        loop.close()
+        print("Pyrogram বট বন্ধ হয়েছে।")
 
+# --- Flask রুটস ---
+@app.route('/')
+def home():
+    return "আপনার Pyrogram বট এবং Flask অ্যাপ সচল আছে! একটি m3u8 লিংক পাঠান।"
 
-# -------------------- Run Both --------------------
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Flask app running on port {port}")
-    flask_app.run(host="0.0.0.0", port=port)
+@app.route('/health')
+def health_check():
+    return "OK", 200
 
-def run_bot():
-    logger.info("Pyrogram bot started")
-    bot.run()
+# --- অ্যাপ্লিকেশন এন্ট্রি পয়েন্ট ---
+if __name__ == '__main__':
+    # Pyrogram বটকে একটি আলাদা থ্রেডে চালান
+    bot_thread = threading.Thread(target=run_bot_in_thread)
+    bot_thread.start()
 
-if __name__ == "__main__":
-    # ✅ থ্রেডিং এর মাধ্যমে দুটি অ্যাপ্লিকেশন একসাথে চালানো হচ্ছে
-    # মনে রাখবেন, Pyrogram async হলেও Flask এখানে blocking.
-    # উন্নত ক্ষেত্রে, asyncio-based web framework (যেমন FastAPI/Quart) ব্যবহার করা যেতে পারে।
-    threading.Thread(target=run_bot).start()
-    run_flask()
+    # Flask অ্যাপ চালান
+    port = int(os.getenv("PORT", 10000))
+    print(f"Flask অ্যাপ পোর্ট {port} এ চলছে...")
+    app.run(host='0.0.0.0', port=port)
