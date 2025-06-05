@@ -4,9 +4,9 @@ from bs4 import BeautifulSoup
 import re
 import os
 
-API_ID = 123456           # 🔁 নিজের API ID বসান
-API_HASH = "your_api_hash"
-BOT_TOKEN = "your_bot_token"
+API_ID = 22697010          # 🔁 নিজের API ID বসান
+API_HASH = "fd88d7339b0371eb2a9501d523f3e2a7"
+BOT_TOKEN = "7704954135:AAGtRtglQqHxzBmD-loFi6R11F19BbNFxx4"
 
 bot = Client("video_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
